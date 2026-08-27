@@ -2,6 +2,12 @@
 
 DeepSeek Harness 的模型自动故障切换（Retry + Failover + 模型健康）插件。
 
+[![version](https://img.shields.io/badge/version-0.1.1--rc.4-green)](https://github.com/guangxiangwu6-cmd/dsh-llm-failover/releases)
+[![license MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen)](https://nodejs.org)
+[![tests](https://img.shields.io/badge/tests-19%2F19%20passing-brightgreen)](test/failover.test.mjs)
+[![boot-safe](https://img.shields.io/badge/boot--safe-rehearsal%20proven-informational)](INSTALL.md)
+
 ## 工作原理
 
 挂在 agent loop 的两个协作式 waterfall 扩展点上（均为最外层监听器），零改动核心循环：
