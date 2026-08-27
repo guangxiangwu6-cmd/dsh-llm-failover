@@ -1,0 +1,18 @@
+# llm-failover 插件安装片段：追加到你的 DSH home 下
+#   profiles/desktop/cordis.patch.yml 末尾（默认 home：Windows %USERPROFILE%\.dsh / Linux·macOS ~/.dsh）
+# models 列表请按实际在用的 provider/model 填写（顺序 = 故障时切换优先级），可配多条。
+
+- insert:
+    - id: llm-failover
+      name: '@deepseek-ai/dsh-llm-failover'
+      config:
+        enabled: true
+        models:
+          - provider: <provider名1>
+            model: <模型名1>
+          # - provider: <provider名2>
+          #   model: <模型名2>
+        maxConsecutiveFailures: 5
+        cooldownSeconds: 60
+        autoRecover: true
+        maxSwitchesPerTurn: 8
