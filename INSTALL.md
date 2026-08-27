@@ -1,6 +1,12 @@
 # dsh-llm-failover 安装 / 卸载 / 启停指南
 
-> 本插件无自动安装逻辑：全程两步手工操作，可完全逆反。建议先照文末做安装前彩排。
+> 本插件无自动安装逻辑：全程三步手工操作，可完全逆反。安装前请先阅读 [README](../README.md) 中的「What & Why」章节了解项目定位。建议先照文末做安装前彩排。
+
+## 前提条件
+
+- DeepSeek Harness Desktop 已安装（支持 node_modules 插件加载的版本）
+- Node.js ≥ 18（已内置于 Harness，无需单独安装）
+lm-pi-ai settings 中已配置至少两个 provider profile（否则 failover 无切换目标）
 
 ## 项目位置与文件
 
@@ -8,9 +14,11 @@
 |------|------|
 | package.json | 插件包描述（名称/入口/依赖声明） |
 | lib/index.js | 插件全部运行时逻辑（单文件，无构建步骤） |
-| test/failover.test.mjs | 场景测试（node --test；数量以运行输出为准） |
-| README.md | 工作原理 / 错误分类 / 全部配置项 |
-| patches/cordis.patch.snippet.yml | 未来安装时要追加的配置片段模板 |
+| test/failover.test.mjs | 19 个场景测试（node --test） |
+| README.md | 产品定位 / 安装 / 配置 / 错误分类 / 架构概述 |
+| docs/ | 技术文档（架构详解 / 会话兼容性 / 故障排查） |
+| patches/cordis.patch.snippet.yml | 安装时要追加的配置片段模板 |
+| scripts/ | QA 彩排脚本 |
 | node_modules/ | 仅隔离测试用（schemastery/cosmokit/@standard-schema 副本），安装时不要复制 |
 
 ## 安装（两步，不联网、不 npm install）
