@@ -59,3 +59,23 @@
 - 插件不追加任何会话事件
 - 决策轨迹只存在于宿主日志（Host 日志面板过滤 `llm-failover`）
 - 若未来 DSH 提供词汇注册面或 `ignorable` 公开写入口，可重新评估恢复事件记录
+
+## 这个 seam 也改不了错误文案（0.2.0 补记）
+
+`agent/request-error` 的返回值类型，按宿主公开的类型目录：
+
+```ts
+export type RequestErrorAction = { kind: 'retry' } | undefined;
+```
+
+也就是说监听器只有两种表态：**要求重试**，或**收手**（让原始 LlmError 冒泡）。它无法替换用户最终看到的
+错误内容。所以 0.2.0 新增的"最早何时恢复、各 provider 处于什么状态"只能写进宿主日志：
+
+```
+no healthy target left (last failure: "commandcode" QUOTA); failing this request.
+  Earliest recovery: "bailian" in 42m (it is admitted as a probe then)
+provider states: commandcode=parked(4h, wall), bailian=parked(42m, failures)
+```
+
+与"不写会话事件"是同一个取舍的两面：**能用宿主支持的通道说清的事，就用；不能的，写进日志并在文档里说明。**
+若将来 `RequestErrorAction` 扩出可携带文案/原因的形状，把这段信息放进用户可见的错误是它的第一个自然用途。

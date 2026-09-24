@@ -83,3 +83,34 @@ EMPTY_RESPONSE 和 QUOTA 默认只 retry 不切换：
 - [ ] **正常对话一轮** — 发起一次普通对话并收到完整回复
 - [ ] **模拟故障观察切换日志** — 临时把 models 池首位改成无效模型名触发失败，日志出现切换记录且会话仍能拿到回复；验证完还原配置
 - [ ] **恢复后确认回池说明** — 故障源恢复后（冷却到期或一次成功出活），日志出现该 provider 恢复/回池记录
+
+## 墙（wall）与探针（probe）：0.2.0 的新日志怎么读
+
+```
+provider "commandcode" request failed (QUOTA, a wall (quota-code)); consecutive failure 1/5: insufficient credits
+provider "commandcode" parked for 4h (quota-code); temporarily switching to "deepseek-official" (deepseek-flash)
+```
+
+- 第二行的括号就是**判定来源**：`quota-code`（harness 分类为 QUOTA）、`message-marker`（账号级措辞）、
+  `provider-retry-after` / `reset-stamp` / `retry-after-prose`（上游公布的重置时间）。有公布时间时括号里写
+  `(the provider's own reset)`，停车时长按上游原样，不做翻倍。
+- 第一次失败就切是**设计行为**：配额/用量窗口是事实不是抖动。模糊措辞（单独一句 "quota exceeded"）不会
+  被当成墙——只有 ≥60 秒的公布重置时间，或明确指向账号级的措辞才算。
+
+```
+provider "bailian" cooldown elapsed; admitting it back as a probe (2 park(s) so far, so the next failure parks it for 2m)
+provider "bailian" parked for 2m after a failed probe; temporarily switching to "deepseek-official" (deepseek-flash)
+```
+
+- 冷却到期不再等于"恢复"，而是**放一次探针**。探针失败立刻回停车（不用重新攒阈值），下一次冷却翻倍。
+- 只有真的出活（`probe succeeded after N park(s); back in the pool with a clean slate`）才清空惩罚。
+
+```
+no healthy target left (last failure: "commandcode" QUOTA); failing this request.
+  Earliest recovery: "bailian" in 42m (it is admitted as a probe then)
+provider states: commandcode=parked(4h, wall), bailian=parked(42m, failures)
+```
+
+- 四个 provider 全停时出现这三行。注意：**这些信息进不了客户端看到的错误**（`RequestErrorAction` 只有
+  `{ kind: 'retry' } | undefined`，这个 seam 改不了文案），所以排查请以宿主日志为准。
+- `autoRecover: false` 时不会自动入场探针，只有重启或一次成功出活能恢复。

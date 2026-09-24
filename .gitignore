@@ -1,2 +1,8 @@
 node_modules/
 *.tmp
+
+# 本地 agent 工具状态与临时物（不属于插件）
+.workbuddy/
+.mimosa/
+.upstream/
+_backups/

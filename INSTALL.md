@@ -98,4 +98,57 @@ node '<彩排目录>\node_modules\@deepseek-ai\dsh\lib\bin.js' --profile headles
 - [ ] **正常对话一轮** —— 验证：发起一次普通对话并收到完整回复，体验与未装插件时无明显差异。
 - [ ] **模拟故障观察切换日志** —— 验证：临时把 models 池首位改成无效模型名触发失败，日志出现切换记录且会话仍能拿到回复；验证完还原配置。
 - [ ] **恢复后确认回池说明** —— 验证：故障源恢复后（冷却到期或一次成功出活），日志出现该 provider 恢复/回池记录，路由回到优先级池首位。
+- [ ] **墙类失败第一次就切** —— 验证：让池首 provider 返回配额类错误（或临时把它的配额用尽），日志出现 `parked for … (quota-code)` 且**第一次失败**就切换；等停车到期后出现 `cooldown elapsed; admitting it back as a probe`。
+
+## 覆盖式安装（推荐）：放在 harness 之外 + profile 用 link: 指过来
+
+把插件拷进 harness 本体的 `node_modules`（上面的两步）有个已知风险：**harness 升级可能整目录替换掉你的副本**。更稳的做法是放在外部覆盖目录，让 profile 用 `link:` 依赖指过去：
+
+```jsonc
+// <DSH_HOME>/profiles/<profile>/package.json
+{
+  "dependencies": {
+    "@deepseek-ai/dsh-llm-failover": "link:C:/path/to/app-patches/dsh-llm-failover"
+  }
+}
+```
+
+改完源码同步过去，用仓库里的脚本（**先备份再覆盖**，被替换的文件进覆盖目录的 `_backups/`）：
+
+```sh
+node tools/sync-to-dsh.mjs --dest "C:/path/to/app-patches/dsh-llm-failover"
+node tools/sync-to-dsh.mjs --dest ... --dry-run        # 只看会动哪些文件
+node tools/sync-to-dsh.mjs --dest ... --stamp mylabel  # 自定义备份后缀
+```
+
+同步后仍需重启 harness（不热重载）。
+
+## 本地回归测试（两套，都不需要 harness 在场）
+
+```sh
+node --test test/failover.test.mjs   # 22 项，node:test 风格；直接导入 lib/index.js
+node test/smoke.test.mjs             # 46 项，纯离线；自带 schemastery 桩与 ctx 替身
+```
+
+`test/failover.test.mjs` 需要 `@deepseek-ai/schemastery` 可解析（harness 环境里天然满足）。在本仓库单独跑它，可先建一个桩（`node_modules/` 已被 gitignore）：
+
+```js
+// node_modules/@deepseek-ai/schemastery/index.js
+const z = function () {};
+z.object = () => ({ __schema: "object" });
+z.string = z.number = z.boolean = z.array = z.union = z.any = z.object;
+export default z;
+```
+
+`test/smoke.test.mjs` 不需要任何准备：它自己把 schemastery 导入换成临时桩，也不依赖 harness 服务。
+
+## 配置项补充（0.2.0）
+
+| 字段 | 默认 | 说明 |
+| --- | --- | --- |
+| `quotaCooldownSeconds` | `14400`（4h） | 「墙」类失败（配额/用量窗口，且上游没公布重置时间）的停车时长 |
+| `maxCooldownSeconds` | `86400`（24h） | 连续停车翻倍的上限，也是相信上游重置时间的上界之一 |
+| `failoverOnQuota` | `true`（0.1.1 是 `false`） | 墙类失败第一次就切；关掉它退回"配额错也交给下游重试"的旧行为 |
+
+判定表（什么算墙、停多久、何时放探针）见 [docs/architecture.md](docs/architecture.md)。
 

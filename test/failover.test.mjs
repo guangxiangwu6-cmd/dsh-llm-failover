@@ -106,7 +106,7 @@ test("Test 2: five consecutive failures mark the model unavailable and switch to
     assert.deepEqual(decision, { kind: "retry" });
     assert.equal(switchLogCount(logs), 1, "exactly one host-log switch record (from A)");
     assert.ok(logs.some(([, m]) => m.includes('switching to "B" (b-1)')), "log names target provider and model");
-    assert.ok(logs.some(([, m]) => m.includes('"A" unavailable after 5 consecutive')), "warn log names the marked provider");
+    assert.ok(logs.some(([, m]) => m.includes('"A" parked for 60s after 5 consecutive')), "warn log names the marked provider and its cooldown");
     assert.equal(agent.session.appended.length, 0, "no session events are ever written (S0 hazard mitigation)");
     const routed = await runRequest(listeners, { provider: "A", model: "a-1", maxTokens: 1024 });
     assert.equal(routed.provider, "B");
@@ -152,31 +152,44 @@ test("Test 5: A -> B -> C all failing ends with a clear terminal stand-down", as
     const decision = await driveToSwitch(listeners, agent, "C");
     assert.equal(decision, undefined, "stand down so the original LlmError surfaces");
     assert.equal(agent.session.appended.length, 0, "stand-down writes no session events");
-    assert.ok(logs.some(([lvl, m]) => lvl === "error" && m.includes("all configured models are currently unavailable")));
+    assert.ok(logs.some(([lvl, m]) => lvl === "error" && m.includes("no healthy target left")));
+    assert.ok(logs.some(([lvl, m]) => lvl === "error" && m.includes("Earliest recovery:")), "the terminal error names when the first provider comes back");
 });
 
-test("Test 6: cooldown expiry re-enters the provider into the pool", async () => {
+test("Test 6: cooldown expiry admits the provider as a probe, and the probe decides", async () => {
     const { ctx, listeners, logs } = makeCtx();
     let clock = 1000;
     apply(ctx, { cooldownSeconds: 60, models: [{ provider: "B", model: "b-1" }] }, { now: () => clock, sleep: NO_SLEEP });
     const agent = makeAgent();
     await driveToSwitch(listeners, agent, "A");
     let routed = await runRequest(listeners, { provider: "A", model: "a-1" });
-    assert.equal(routed.provider, "B");
+    assert.equal(routed.provider, "B", "parked A is bypassed");
     clock += 61000;
     routed = await runRequest(listeners, { provider: "A", model: "a-1" });
-    assert.equal(routed.provider, "A", "lazy health check recovers A after cooldown");
+    assert.equal(routed.provider, "A", "expiry admits A as a half-open probe rather than declaring it healthy");
     assert.ok(logs.some(([, m]) => m.includes("cooldown elapsed") && m.includes('"A"')));
+    // The probe failed: re-parked at once, without re-earning the threshold,
+    // and the next cooldown is longer than the last one.
     const switchesBefore = switchLogCount(logs);
+    const probeFailed = await runError(listeners, errorPayload(agent, "A", "SERVER"));
+    assert.deepEqual(probeFailed, { kind: "retry" }, "a failed probe switches immediately");
+    assert.equal(switchLogCount(logs), switchesBefore + 1, "exactly one switch record for the failed probe");
+    assert.ok(logs.some(([, m]) => m.includes('provider "A" parked for 2m after a failed probe')), "the re-park escalates 60s -> 2m");
+    // A proven success clears the ledger and forfeits the escalation penalty.
+    clock += 121000;
+    await runRequest(listeners, { provider: "A", model: "a-1" });
+    emitSessionEvent(listeners, { type: "assistant/message", data: { message: { source: { provider: "A", model: "a-1" } } } });
+    assert.ok(logs.some(([, m]) => m.includes('provider "A" probe succeeded')));
+    const switchesAfter = switchLogCount(logs);
     for (let i = 1; i < 5; i++) await runError(listeners, errorPayload(agent, "A", "SERVER"));
-    assert.equal(switchLogCount(logs), switchesBefore, "fresh streak starts at zero after recovery");
+    assert.equal(switchLogCount(logs), switchesAfter, "fresh streak starts at zero after a proven recovery");
 });
 
 test("Test 7: permanent errors never fail over; every transient class does", async () => {
     const { ctx, listeners } = makeCtx();
     apply(ctx, { models: [{ provider: "B", model: "b-1" }] }, { sleep: NO_SLEEP });
     const agent = makeAgent();
-    const ineligible = ["AUTH", "INVALID_CREDENTIAL", "INVALID_REQUEST", "CONTEXT_WINDOW_EXCEEDED", "UNKNOWN_MODEL", "UNSUPPORTED_CONTENT", "ABORTED", "QUOTA"];
+    const ineligible = ["AUTH", "INVALID_CREDENTIAL", "INVALID_REQUEST", "CONTEXT_WINDOW_EXCEEDED", "UNKNOWN_MODEL", "UNSUPPORTED_CONTENT", "ABORTED"];
     for (const code of ineligible) {
         for (let i = 0; i < 8; i++) {
             const decision = await runError(listeners, errorPayload(agent, "A", code));
@@ -192,6 +205,43 @@ test("Test 7: permanent errors never fail over; every transient class does", asy
     }
 });
 
+test("Test 7c: a quota wall switches on the FIRST failure and parks for hours", async () => {
+    const { ctx, listeners, logs } = makeCtx();
+    apply(ctx, { models: [{ provider: "B", model: "b-1" }] }, { sleep: NO_SLEEP });
+    const agent = makeAgent();
+    const decision = await runError(listeners, errorPayload(agent, "A", "QUOTA"));
+    assert.deepEqual(decision, { kind: "retry" }, "a wall does not wait for the consecutive-failure threshold");
+    assert.equal(switchLogCount(logs), 1, "exactly one switch record");
+    assert.ok(logs.some(([, m]) => m.includes('provider "A" parked for 4h (quota-code)')), "the wall park is hours and names its source");
+});
+
+test("Test 7d: a provider-published reset is honoured verbatim, a short one stays a blip", async () => {
+    const { ctx, listeners, logs } = makeCtx();
+    let clock = 1000;
+    apply(ctx, { models: [{ provider: "B", model: "b-1" }] }, { now: () => clock, sleep: NO_SLEEP });
+    const agent = makeAgent();
+    const wall = await runError(listeners, {
+        agent, turn: 1, step: 1, provider: "A",
+        failure: { code: "RATE_LIMIT", message: "slow down", providerRetryAfterMs: 5 * 3600 * 1000 },
+        retryPolicy: undefined, signal: undefined
+    });
+    assert.deepEqual(wall, { kind: "retry" }, "a published 5h reset is a wall: switch now");
+    assert.ok(logs.some(([, m]) => m.includes('provider "A" parked for 5h (the provider\'s own reset)')), "the published reset is used verbatim");
+    clock += 4 * 3600 * 1000;
+    assert.equal((await runRequest(listeners, { provider: "A", model: "a-1" })).provider, "B", "still parked four hours later");
+    clock += 2 * 3600 * 1000;
+    assert.equal((await runRequest(listeners, { provider: "A", model: "a-1" })).provider, "A", "admitted as a probe once the published reset passes");
+
+    const blipCtx = makeCtx();
+    apply(blipCtx.ctx, { models: [{ provider: "B", model: "b-1" }] }, { now: () => clock, sleep: NO_SLEEP });
+    const blip = await runError(blipCtx.listeners, {
+        agent: makeAgent(), turn: 1, step: 1, provider: "A",
+        failure: { code: "RATE_LIMIT", message: "bursty", providerRetryAfterMs: 1500 },
+        retryPolicy: undefined, signal: undefined
+    });
+    assert.deepEqual(blip, { kind: "retry" });
+    assert.ok(!blipCtx.logs.some(([, m]) => m.includes("parked for")), "a 1.5s reset is a blip: no park, the threshold rules apply");
+});
 test("Test 7b: per-class toggles disable individual transient classes", async () => {
     const { ctx, listeners } = makeCtx();
     apply(ctx, { failoverOnRateLimit: false, models: [{ provider: "B", model: "b-1" }] });
@@ -258,17 +308,37 @@ test("Test 12: per-turn switch cap stops infinite ping-pong within one turn", as
 });
 
 test("Test 13: autoRecover=false keeps the failed provider out until proven healthy", async () => {
-    const { ctx, listeners } = makeCtx();
+    // Time alone never restores it.
+    {
+        const { ctx, listeners } = makeCtx();
+        let clock = 1000;
+        apply(ctx, { autoRecover: false, cooldownSeconds: 60, models: [{ provider: "B", model: "b-1" }] }, { now: () => clock, sleep: NO_SLEEP });
+        await driveToSwitch(listeners, makeAgent(), "A");
+        clock += 3600000;
+        assert.equal((await runRequest(listeners, { provider: "A", model: "a-1" })).provider, "B", "no time-based recovery when autoRecover is off");
+    }
+    // A proven success does — with no reroute in the same window, so the
+    // attribution is conclusive (the ambiguity guard refuses inherited routes).
+    {
+        const { ctx, listeners, logs } = makeCtx();
+        let clock = 1000;
+        apply(ctx, { autoRecover: false, cooldownSeconds: 60, models: [{ provider: "B", model: "b-1" }] }, { now: () => clock, sleep: NO_SLEEP });
+        await driveToSwitch(listeners, makeAgent(), "A");
+        emitSessionEvent(listeners, { type: "assistant/message", data: { message: { source: { provider: "A", model: "a-1" } } } });
+        assert.ok(logs.some(([, m]) => m.includes('provider "A" recovered')), "proof-of-life clears the ledger");
+        assert.equal((await runRequest(listeners, { provider: "A", model: "a-1" })).provider, "A", "active proof-of-life restores A immediately");
+    }
+});
+
+test("Test 13b: a success arriving right after our own reroute is refused (ambiguity guard)", async () => {
+    const { ctx, listeners, logs } = makeCtx();
     let clock = 1000;
-    apply(ctx, { autoRecover: false, cooldownSeconds: 60, models: [{ provider: "B", model: "b-1" }] }, { now: () => clock, sleep: NO_SLEEP });
-    const agent = makeAgent();
-    await driveToSwitch(listeners, agent, "A");
-    clock += 3600000;
-    const routed = await runRequest(listeners, { provider: "A", model: "a-1" });
-    assert.equal(routed.provider, "B", "no time-based recovery when autoRecover is off");
+    apply(ctx, { cooldownSeconds: 60, models: [{ provider: "B", model: "b-1" }] }, { now: () => clock, sleep: NO_SLEEP });
+    await driveToSwitch(listeners, makeAgent(), "A");
+    assert.equal((await runRequest(listeners, { provider: "A", model: "a-1" })).provider, "B", "A parked, request rerouted away");
     emitSessionEvent(listeners, { type: "assistant/message", data: { message: { source: { provider: "A", model: "a-1" } } } });
-    const stillRouted = await runRequest(listeners, { provider: "A", model: "a-1" });
-    assert.equal(stillRouted.provider, "A", "active proof-of-life restores A immediately");
+    assert.ok(logs.some(([, m]) => m.includes("ignoring a success attributed to")), "the inherited attribution is rejected");
+    assert.ok(!logs.some(([, m]) => m.includes('provider "A" recovered')), "the cooldown stands");
 });
 
 test("Test 14: activation never throws - garbage config degrades to safe defaults", async () => {
