@@ -19,7 +19,13 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const pluginSource = fs.readFileSync(path.join(here, "..", "lib", "index.js"), "utf8");
 
 const stamp = Date.now();
-const stubPath = path.join(os.tmpdir(), "schemastery-stub-" + stamp + ".mjs");
+// The plugin reads its version from the manifest beside it, so the sandbox has
+// to look like a real install: <work>/lib/index.mjs + <work>/package.json.
+const workDir = path.join(os.tmpdir(), "dsh-llm-failover-under-test-" + stamp);
+const libDir = path.join(workDir, "lib");
+fs.mkdirSync(libDir, { recursive: true });
+fs.copyFileSync(path.join(here, "..", "package.json"), path.join(workDir, "package.json"));
+const stubPath = path.join(workDir, "schemastery-stub.mjs");
 fs.writeFileSync(stubPath, [
   "// Stub for @deepseek-ai/schemastery (loader schema is deliberately permissive).",
   "const z = function () {};",
@@ -38,7 +44,7 @@ if (patchedSource === pluginSource) {
   process.exit(2);
 }
 
-const pluginPath = path.join(os.tmpdir(), "dsh-llm-failover-under-test-" + stamp + ".mjs");
+const pluginPath = path.join(libDir, "index.mjs");
 fs.writeFileSync(pluginPath, patchedSource);
 const plugin = await import(pathToFileURL(pluginPath).href);
 
@@ -93,6 +99,9 @@ const POOL = [
   console.log("  [activation] " + active);
   check("activation log reports entries and distinct providers",
     !!active && active.indexOf("4 pool entry/entries covering 4 provider(s)") >= 0);
+  const manifestVersion = JSON.parse(fs.readFileSync(path.join(here, "..", "package.json"), "utf8")).version;
+  check("activation log names the deployed version",
+    !!active && active.indexOf("(v" + manifestVersion + ";") >= 0, active);
   check("no inert-entry warning for a clean pool",
     !logs.some((l) => l.indexOf("repeat a provider") >= 0));
 }
@@ -343,10 +352,28 @@ const POOL = [
     logs.some((l) => l.indexOf("provider states:") >= 0 && l.indexOf("parked(") >= 0));
 }
 
+// --- a copy without its manifest still activates: the version degrades, nothing throws
+{
+  const bareLib = path.join(workDir, "bare", "lib");
+  fs.mkdirSync(bareLib, { recursive: true });
+  const barePath = path.join(bareLib, "index.mjs");
+  fs.writeFileSync(barePath, patchedSource);
+  const bare = await import(pathToFileURL(barePath).href);
+  const { ctx: bareCtx, logs: bareLogs } = makeCtx();
+  let threw = false;
+  try {
+    bare.apply(bareCtx, { enabled: true, models: POOL });
+  } catch {
+    threw = true;
+  }
+  const bareLine = bareLogs.find((l) => l.indexOf("active (") >= 0);
+  check("a copy without its manifest still activates", !threw && !!bareLine);
+  check("and says the version is unknown rather than lying", !!bareLine && bareLine.indexOf("(vunknown;") >= 0, bareLine);
+}
+
 console.log("");
 console.log("RESULT: " + pass + " passed, " + fail + " failed");
 try {
-  fs.unlinkSync(stubPath);
-  fs.unlinkSync(pluginPath);
+  fs.rmSync(workDir, { recursive: true, force: true });
 } catch {}
 process.exit(fail === 0 ? 0 : 1);

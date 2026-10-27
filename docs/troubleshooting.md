@@ -14,7 +14,7 @@
 
 ## models 没有配置
 
-**症状**：插件加载成功（日志有 `llm-failover active`），但从不切换。
+**症状**：插件加载成功（日志有 `llm-failover: active (v<版本>; …)`），但从不切换。
 
 **原因**：`models` 为空时插件保持惰性，仅日志提示，不执行切换。
 
@@ -80,7 +80,7 @@ AUTH / INVALID_CREDENTIAL 表示 API Key 无效。这是凭证问题，切换到
 安装并重启后按顺序逐项勾选：
 
 - [ ] **重启成功** — DeepSeek Harness Desktop 能正常进入主界面，无报错弹窗
-- [ ] **插件激活** — 宿主日志面板出现 `llm-failover active` 行
+- [ ] **插件激活** — 宿主日志面板出现 `llm-failover: active (v<版本>; …)` 行，版本号与 `package.json` 一致
 - [ ] **正常对话一轮** — 发起一次普通对话并收到完整回复
 - [ ] **模拟故障观察切换日志** — 让池首 provider 可控地失败（把该 profile 的 base URL 指向没人监听的本地端口 → TRANSPORT；或用一个返回 429/503 的本地 mock），日志出现切换记录且会话仍能拿到回复；验证完还原配置。不要用"无效模型名"：`UNKNOWN_MODEL` 是永久错误，永不切换
 - [ ] **恢复后确认回池说明** — 故障源恢复后（冷却到期或一次成功出活），日志出现该 provider 恢复/回池记录

@@ -94,7 +94,7 @@ node '<彩排目录>\node_modules\@deepseek-ai\dsh\lib\bin.js' --profile headles
 安装并重启后按顺序逐项勾选，全部通过才算安装完成；任何一项不过，先按「卸载（完全可逆）」回退再排查。
 
 - [ ] **重启成功** —— 验证：重启 DeepSeek Harness Desktop 能正常进入主界面，无报错弹窗。
-- [ ] **插件激活** —— 验证：桌面 profile 的宿主日志面板出现 `llm-failover active` 行（日志里过滤 llm-failover）。
+- [ ] **插件激活** —— 验证：桌面 profile 的宿主日志面板出现 `llm-failover: active (v<版本>; …)` 行（过滤 `llm-failover`），括号里的版本必须等于 `package.json` 的 `version`。
 - [ ] **正常对话一轮** —— 验证：发起一次普通对话并收到完整回复，体验与未装插件时无明显差异。
 - [ ] **模拟故障观察切换日志** —— 验证：让池首 provider 可控地失败（例如把它那个 profile 的 base URL 指向一个没人监听的本地端口 → TRANSPORT 类失败，或用一个返回 429/503 的本地 mock），日志出现切换记录且会话仍能拿到回复；验证完还原配置。**不要**用"改成无效模型名"来触发：`UNKNOWN_MODEL` 属于永久错误，永不切换。
 - [ ] **恢复后确认回池说明** —— 验证：故障源恢复后（冷却到期或一次成功出活），日志出现该 provider 恢复/回池记录，路由回到优先级池首位。

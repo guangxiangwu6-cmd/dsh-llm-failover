@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { apply, resolveResetPlan } from "../lib/index.js";
 
 /** No-op sleep keeps the self-fallback retry backoff instantaneous in tests. */
@@ -613,5 +614,26 @@ test("Test 28: indefinite parks are named in the terminal dump instead of claimi
     assert.ok(dump[1].includes("A=parked(indefinitely"), "A is reported as parked indefinitely");
     assert.ok(dump[1].includes("B=parked(indefinitely"), "B is reported as parked indefinitely");
     assert.ok(!dump[1].includes("every configured provider is healthy"), "it never claims all providers are healthy");
+});
+
+test("Test 29: every startup line names the version the code actually is", () => {
+    const version = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
+    assert.match(version, /^\d+\.\d+\.\d+/, "package.json carries a version");
+
+    const active = makeCtx();
+    apply(active.ctx, { models: [{ provider: "B", model: "b-1" }] });
+    const activeLine = active.logs.find(([, m]) => m.includes("llm-failover: active ("));
+    assert.ok(activeLine !== undefined, "the active line is logged");
+    assert.ok(activeLine[1].includes(`v${version}`), `the active line carries v${version}: ${activeLine[1]}`);
+
+    const inert = makeCtx();
+    apply(inert.ctx, {});
+    const inertLine = inert.logs.find(([, m]) => m.includes("staying inert"));
+    assert.ok(inertLine !== undefined && inertLine[1].includes(`v${version}`), "the inert line carries the same version");
+
+    const off = makeCtx();
+    apply(off.ctx, { enabled: false, models: [{ provider: "B", model: "b-1" }] });
+    const offLine = off.logs.find(([, m]) => m.includes("disabled by configuration"));
+    assert.ok(offLine !== undefined && offLine[1].includes(`v${version}`), "the disabled line carries the same version");
 });
 //#endregion

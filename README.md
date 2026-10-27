@@ -9,7 +9,7 @@ DeepSeek Harness 的社区模型自动故障切换插件。当 Provider 出现 4
 [![version](https://img.shields.io/badge/version-0.2.0--rc.2-green)](https://github.com/guangxiangwu6-cmd/dsh-llm-failover/releases)
 [![license MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen)](https://nodejs.org)
-[![tests](https://img.shields.io/badge/tests-80%2F80%20passing-brightgreen)](test/failover.test.mjs)
+[![tests](https://img.shields.io/badge/tests-84%2F84%20passing-brightgreen)](test/failover.test.mjs)
 [![boot-safe](https://img.shields.io/badge/boot--safe-rehearsal%20proven-informational)](INSTALL.md)
 
 ## What & Why
@@ -58,7 +58,7 @@ Cooldown expires → A 以「探针」身份入场，一次请求定生死
 - **最大切换保护** — 单回合切换上限防止死循环
 - **错误分类** — 7 种可恢复错误 + 多种永久错误，精确决定是否切换；每类一个开关
 - **终止时说得清** — 所有 provider 都停车时，日志给出最早恢复的是谁、还有多久，并附全 provider 状态快照
-- **两套本地测试** — `node --test test/failover.test.mjs`（34 项，node:test 风格）+ `node test/smoke.test.mjs`（46 项，纯离线、不需要 harness）
+- **两套本地测试** — `node --test test/failover.test.mjs`（35 项，node:test 风格）+ `node test/smoke.test.mjs`（49 项，纯离线、不需要 harness）
 - **敏感信息日志脱敏** — URL 凭据 / Bearer token / key 参数自动掩码
 - **Session 安全设计** — 不写自定义事件类型，避免会话重载兼容问题
 - **与 llm-retry 共存** — 阈值以下决策权归 llm-retry，达到阈值才由本插件接管；下游任何决定都原样尊重
@@ -79,7 +79,7 @@ Copy-Item "<本仓库目录>\\*" $dst -Recurse -Force -Exclude node_modules
 # 3. 重启 DeepSeek Harness Desktop
 ```
 
-启动日志出现 `llm-failover active` 即加载成功。详见 [INSTALL.md](INSTALL.md)。
+启动日志出现 `llm-failover: active (v<版本>; …)` 即加载成功，括号里的版本号就是当前真正在跑的构建（读自部署目录的 `package.json`）。
 
 完全可逆：删目录 + 删配置块 + 重启。
 
@@ -189,7 +189,7 @@ provider 都在停车；那时日志会给出最早恢复的那个是谁、还�
 
 > **Release Candidate** — 版本 0.2.0-rc.2
 
-- ✅ 核心 failover 功能已实现并通过两套本地回归测试（`node --test test/failover.test.mjs` 34 项 + `node test/smoke.test.mjs` 46 项，合计 80 项，都不需要 harness 在场）
+- ✅ 核心 failover 功能已实现并通过两套本地回归测试（`node --test test/failover.test.mjs` 35 项 + `node test/smoke.test.mjs` 49 项，合计 84 项，都不需要 harness 在场）
 - ✅ 启动安全设计经真实加载器验证（见 [INSTALL.md](INSTALL.md) 的安装前冒烟彩排）
 - ✅ 已安装进真实 DSH Desktop 环境（2026-08-27）
 - ✅ 冷却保护（2026-09-21）：切换后返回的"成功"证据若与插件自己发起的改道冲突，会被判为歧义并拒收，避免冷却被提前取消
