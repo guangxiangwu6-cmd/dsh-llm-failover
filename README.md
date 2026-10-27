@@ -196,7 +196,7 @@ provider 都在停车；那时日志会给出最早恢复的那个是谁、还�
 - ✅ **墙/抖动分开 + half-open 探针（2026-09-25）**：配额与用量窗口第一次就切并按上游公布的重置时间停车；冷却到期改为放一次探针，探针失败立刻回停车且冷却翻倍封顶；终止日志给出最早恢复时间与全 provider 状态。判定表与取舍见 [docs/architecture.md](docs/architecture.md)，借鉴来源见下
 - ✅ **rc.2 状态机修复（2026-10-27）**：已停车 provider 的迟到失败不再重复停车、不再延长冷却；歧义成功的拒收覆盖整段停车期（4h 墙与无限停车都绕不过去）；同代 half-open 探针的迟到失败按探针失败处理，而不是从 1/5 重新计数；一次失败里的多个重置信号取**最晚**；上游公布的重置不再被 `maxCooldownSeconds` 截断；自回退等待尊重 Retry-After；长回合的切换预算不再被 TTL 清扫掉；`autoRecover: false` 的无限停车在终止日志里如实写 `parked(indefinitely …)`
 - ✅ QA 彩排脚本 6 个（smoke / badconfig / disabled / doc-crosscheck / s0-session-compat / final-round）
-- 🔄 当前生产配置：4 个目标，每厂商一条 —— deepseek-official/deepseek-flash、bailian/qwen3.8-flash、ark-plan/glm-5.3-flash、commandcode/deepseek/deepseek-v4.1-flash
+- 🔄 当前生产配置：3 个目标 —— bailian/qwen3.8-flash、commandcode/deepseek/deepseek-v4.1-flash、deepseek-official/deepseek-flash（付费的 deepseek-official 排最后，只在其它目标都不可用时才切过去）
 
 ### Intentionally descoped
 
