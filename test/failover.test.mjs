@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { apply } from "../lib/index.js";
+import { apply, resolveResetPlan } from "../lib/index.js";
 
 /** No-op sleep keeps the self-fallback retry backoff instantaneous in tests. */
 const NO_SLEEP = async () => {};
@@ -181,6 +181,10 @@ test("Test 6: cooldown expiry admits the provider as a probe, and the probe deci
     emitSessionEvent(listeners, { type: "assistant/message", data: { message: { source: { provider: "A", model: "a-1" } } } });
     assert.ok(logs.some(([, m]) => m.includes('provider "A" probe succeeded')));
     const switchesAfter = switchLogCount(logs);
+    // A real attempt is always preceded by a request build, and that build is
+    // what settles the probe generation (see rewriteRoute): the next failure is
+    // therefore the first of a fresh cycle, not a late probe result.
+    assert.equal((await runRequest(listeners, { provider: "A", model: "a-1" })).provider, "A");
     for (let i = 1; i < 5; i++) await runError(listeners, errorPayload(agent, "A", "SERVER"));
     assert.equal(switchLogCount(logs), switchesAfter, "fresh streak starts at zero after a proven recovery");
 });
@@ -303,8 +307,8 @@ test("Test 12: per-turn switch cap stops infinite ping-pong within one turn", as
     const decision = await driveToSwitch(listeners, agent, "B");
     assert.equal(decision, undefined, "cap reached: stand down instead of switching again");
     emitStatus(listeners, agent, "idle");
-    const revived = await driveToSwitch(listeners, agent, "B");
-    assert.deepEqual(revived, { kind: "retry" }, "idle reset re-arms the budget");
+    const revived = await runError(listeners, errorPayload(agent, "B", "RATE_LIMIT"));
+    assert.deepEqual(revived, { kind: "retry" }, "idle reset re-arms the budget (a late failure on the parked provider is switchable again)");
 });
 
 test("Test 13: autoRecover=false keeps the failed provider out until proven healthy", async () => {
@@ -398,3 +402,216 @@ test("Test 18: cooldownSeconds of zero is rejected and falls back to the default
     routed = await runRequest(listeners, { provider: "A", model: "a-1" });
     assert.equal(routed.provider, "A", "default cooldown expires on schedule (no zero-length oscillation)");
 });
+
+//#region v0.2.0-rc.2 regressions
+
+/** Count park records for one provider; the deadline is only ever set where one is logged. */
+function parkLogCount(logs, provider) {
+    return logs.filter(([, m]) => m.includes(`"${provider}" parked for`)).length;
+}
+
+test("Test 19: late failures on an already-parked provider never extend its cooldown", async () => {
+    const { ctx, listeners, logs } = makeCtx();
+    let clock = 1000;
+    apply(ctx, { models: [{ provider: "B", model: "b-1" }] }, { now: () => clock, sleep: NO_SLEEP });
+    const agent = makeAgent();
+    assert.deepEqual(await runError(listeners, errorPayload(agent, "A", "QUOTA")), { kind: "retry" }, "the first quota wall parks A");
+    assert.equal(parkLogCount(logs, "A"), 1);
+    clock += 60 * 1000;
+    // A later report about the same provider (an in-flight request that was
+    // built before the park) is old news: it must not re-park A.
+    const late = await runError(listeners, errorPayload(agent, "A", "QUOTA"));
+    assert.equal(parkLogCount(logs, "A"), 1, "no second park record, so no recomputed deadline");
+    assert.deepEqual(late, { kind: "retry" }, "the request still moves to a healthy target");
+    assert.ok(logs.some(([, m]) => m.includes('"A"') && m.includes("already parked")), "the late failure is logged as already parked");
+    // The original 4h deadline stands.
+    clock += 4 * 3600 * 1000 - 61 * 1000;
+    assert.equal(parkLogCount(logs, "A"), 1, "still no re-park after four hours of late reports");
+    assert.equal((await runRequest(listeners, { provider: "A", model: "a-1" })).provider, "B", "the original deadline still holds");
+    clock += 2000;
+    assert.equal((await runRequest(listeners, { provider: "A", model: "a-1" })).provider, "A", "admitted as a probe right on schedule");
+});
+
+test("Test 19b: a late failure with no healthy target stands down instead of re-parking", async () => {
+    const { ctx, listeners, logs } = makeCtx();
+    apply(ctx, { models: [{ provider: "A", model: "a-1" }] }, { sleep: NO_SLEEP });
+    const agent = makeAgent();
+    assert.equal(await runError(listeners, errorPayload(agent, "A", "QUOTA")), undefined, "the only provider parks and the listener stands down");
+    const parks = parkLogCount(logs, "A");
+    const stands = logs.filter(([, m]) => m.includes("no healthy target left")).length;
+    assert.equal(await runError(listeners, errorPayload(agent, "A", "QUOTA")), undefined, "the late repeat stands down too");
+    assert.equal(parkLogCount(logs, "A"), parks, "the deadline is not recomputed");
+    assert.equal(logs.filter(([, m]) => m.includes("no healthy target left")).length, stands + 1, "the second stand-down is logged as such");
+    assert.ok(logs.some(([, m]) => m.includes('"A" QUOTA while already parked')), "and it says the park already stands");
+});
+
+test("Test 20: the ambiguity guard covers the whole parking period, not just 60s", async () => {
+    const { ctx, listeners, logs } = makeCtx();
+    let clock = 1000;
+    apply(ctx, { models: [{ provider: "B", model: "b-1" }] }, { now: () => clock, sleep: NO_SLEEP });
+    const success = () => emitSessionEvent(listeners, { type: "assistant/message", data: { message: { source: { provider: "A", model: "a-1" } } } });
+    await runError(listeners, errorPayload(makeAgent(), "A", "QUOTA"));
+    assert.equal((await runRequest(listeners, { provider: "A", model: "a-1" })).provider, "B", "A parked, the request is rerouted to B");
+    for (const advance of [61 * 1000, 3600 * 1000]) {
+        clock += advance;
+        success();
+        assert.ok(logs.some(([, m]) => m.includes("ignoring a success attributed to")), `a success ${advance}ms after the reroute is refused`);
+        assert.ok(!logs.some(([, m]) => m.includes('provider "A" recovered')), "the wall cooldown stands");
+        assert.equal((await runRequest(listeners, { provider: "A", model: "a-1" })).provider, "B", "A stays parked");
+    }
+    clock += 4 * 3600 * 1000;
+    assert.equal((await runRequest(listeners, { provider: "A", model: "a-1" })).provider, "A", "the real probe is still admitted on schedule");
+    success();
+    assert.ok(logs.some(([, m]) => m.includes('provider "A" probe succeeded')), "a genuine probe success still clears the ledger");
+});
+
+test("Test 21: with autoRecover off a reroute makes every later success ambiguous", async () => {
+    const { ctx, listeners, logs } = makeCtx();
+    let clock = 1000;
+    apply(ctx, { autoRecover: false, models: [{ provider: "B", model: "b-1" }] }, { now: () => clock, sleep: NO_SLEEP });
+    await runError(listeners, errorPayload(makeAgent(), "A", "QUOTA"));
+    assert.equal((await runRequest(listeners, { provider: "A", model: "a-1" })).provider, "B", "A parked indefinitely, the request is rerouted");
+    clock += 3600 * 1000;
+    emitSessionEvent(listeners, { type: "assistant/message", data: { message: { source: { provider: "A", model: "a-1" } } } });
+    assert.ok(logs.some(([, m]) => m.includes("ignoring a success attributed to")), "the indefinite park is not lifted by an inherited success");
+    assert.equal((await runRequest(listeners, { provider: "A", model: "a-1" })).provider, "B", "A is still out of the pool");
+});
+
+test("Test 22: a same-generation probe that fails late is a failed probe, not a fresh streak", async () => {
+    const { ctx, listeners, logs } = makeCtx();
+    let clock = 1000;
+    apply(ctx, { cooldownSeconds: 60, models: [{ provider: "B", model: "b-1" }] }, { now: () => clock, sleep: NO_SLEEP });
+    const agent = makeAgent();
+    await driveToSwitch(listeners, agent, "A");
+    clock += 61 * 1000;
+    // Two concurrent probes of the same generation are admitted (this seam
+    // cannot cap probe concurrency; it must still judge both results).
+    assert.equal((await runRequest(listeners, { provider: "A", model: "a-1" })).provider, "A");
+    assert.equal((await runRequest(listeners, { provider: "A", model: "a-1" })).provider, "A");
+    emitSessionEvent(listeners, { type: "assistant/message", data: { message: { source: { provider: "A", model: "a-1" } } } });
+    assert.ok(logs.some(([, m]) => m.includes('provider "A" probe succeeded')), "the first probe reports success");
+    const switches = switchLogCount(logs);
+    const mark = logs.length;
+    const late = await runError(listeners, errorPayload(agent, "A", "SERVER"));
+    assert.deepEqual(late, { kind: "retry" }, "the late failure of the same generation switches immediately");
+    assert.equal(switchLogCount(logs), switches + 1);
+    assert.ok(logs.some(([, m]) => m.includes('"A" parked for 2m after a late same-generation probe failure')), "the re-park escalates exactly like a failed probe");
+    assert.ok(!logs.slice(mark).some(([, m]) => m.includes("consecutive failure 1/5")), "it is never counted as a fresh first failure");
+    assert.equal((await runRequest(listeners, { provider: "A", model: "a-1" })).provider, "B", "A is out of the pool again");
+});
+
+test("Test 22b: a fresh request after a proven recovery starts a clean cycle", async () => {
+    const { ctx, listeners, logs } = makeCtx();
+    let clock = 1000;
+    apply(ctx, { cooldownSeconds: 60, models: [{ provider: "B", model: "b-1" }] }, { now: () => clock, sleep: NO_SLEEP });
+    const agent = makeAgent();
+    await driveToSwitch(listeners, agent, "A");
+    clock += 61 * 1000;
+    assert.equal((await runRequest(listeners, { provider: "A", model: "a-1" })).provider, "A", "probe admitted");
+    emitSessionEvent(listeners, { type: "assistant/message", data: { message: { source: { provider: "A", model: "a-1" } } } });
+    // A brand-new request is built on the recovered provider: the previous
+    // generation is settled, so a failure on it counts normally.
+    assert.equal((await runRequest(listeners, { provider: "A", model: "a-1" })).provider, "A");
+    const switches = switchLogCount(logs);
+    const mark = logs.length;
+    const decision = await runError(listeners, errorPayload(agent, "A", "SERVER"));
+    assert.deepEqual(decision, { kind: "retry" }, "below the threshold the downstream stack keeps ownership");
+    assert.equal(switchLogCount(logs), switches, "one failure is not a probe failure");
+    assert.ok(logs.slice(mark).some(([, m]) => m.includes("consecutive failure 1/5")), "the fresh cycle counts from one");
+});
+
+test("Test 23: the latest trusted reset wins over an earlier short signal", async () => {
+    const nowMs = Date.parse("2026-09-25T00:00:00Z");
+    const plan = resolveResetPlan({
+        code: "RATE_LIMIT",
+        message: "slow down; retry again in 30 seconds; usage limit for your plan has been reached; resets at 2026-09-25T03:00:00Z",
+        providerRetryAfterMs: 5000
+    }, nowMs);
+    assert.equal(plan.wall, true, "a long window is still a wall");
+    assert.equal(plan.parkMs, 3 * 3600 * 1000, "the latest signal wins, not the first one seen");
+    assert.equal(plan.source, "reset-stamp", "the source names the signal actually used");
+});
+
+test("Test 24: an upstream-published reset is not clamped by maxCooldownSeconds", async () => {
+    const { ctx, listeners, logs } = makeCtx();
+    let clock = 1000;
+    apply(ctx, { maxCooldownSeconds: 60, models: [{ provider: "B", model: "b-1" }] }, { now: () => clock, sleep: NO_SLEEP });
+    const decision = await runError(listeners, {
+        agent: makeAgent(), turn: 1, step: 1, provider: "A",
+        failure: { code: "RATE_LIMIT", message: "slow down", providerRetryAfterMs: 5 * 3600 * 1000 },
+        retryPolicy: undefined, signal: undefined
+    });
+    assert.deepEqual(decision, { kind: "retry" }, "a published 5h reset is a wall");
+    assert.ok(logs.some(([, m]) => m.includes("parked for 5h (the provider's own reset)")), "the published window is used verbatim, not clamped to the local 60s cap");
+    clock += 61 * 1000;
+    assert.equal((await runRequest(listeners, { provider: "A", model: "a-1" })).provider, "B", "still parked a minute later");
+    clock += 5 * 3600 * 1000;
+    assert.equal((await runRequest(listeners, { provider: "A", model: "a-1" })).provider, "A", "admitted as a probe once the published reset passes");
+});
+
+test("Test 25: a short Retry-After is not logged as the provider's own reset", async () => {
+    const { ctx, listeners, logs } = makeCtx();
+    let clock = 1000;
+    apply(ctx, { models: [{ provider: "B", model: "b-1" }] }, { now: () => clock, sleep: NO_SLEEP });
+    const agent = makeAgent();
+    let decision;
+    for (let i = 0; i < 5; i++) {
+        decision = await runError(listeners, {
+            agent, turn: 7, step: 3, provider: "A",
+            failure: { code: "RATE_LIMIT", message: "bursty", providerRetryAfterMs: 1500 },
+            retryPolicy: undefined, signal: undefined
+        });
+    }
+    assert.deepEqual(decision, { kind: "retry" }, "the threshold still switches");
+    assert.ok(logs.some(([, m]) => m.includes('provider "A" parked for 60s after 5 consecutive RATE_LIMIT failures')), "the local 60s penalty is what was applied");
+    assert.ok(!logs.some(([, m]) => m.includes("the provider's own reset")), "the log does not claim an upstream reset it did not use");
+});
+
+test("Test 26: the self-fallback wait respects the provider's Retry-After", async () => {
+    const slept = [];
+    const { ctx, listeners } = makeCtx();
+    apply(ctx, { models: [{ provider: "B", model: "b-1" }] }, { sleep: async (ms) => { slept.push(ms); } });
+    await runError(listeners, {
+        agent: makeAgent(), turn: 1, step: 1, provider: "A",
+        failure: { code: "RATE_LIMIT", message: "slow down", providerRetryAfterMs: 30000 },
+        retryPolicy: undefined, signal: undefined
+    }, async () => undefined);
+    assert.equal(slept.length, 1, "the fallback retry waited once");
+    assert.ok(slept[0] >= 30000, `waited at least the published 30s (got ${slept[0]}ms)`);
+
+    const control = [];
+    const plain = makeCtx();
+    apply(plain.ctx, { models: [{ provider: "B", model: "b-1" }] }, { sleep: async (ms) => { control.push(ms); } });
+    await runError(plain.listeners, errorPayload(makeAgent(), "A", "RATE_LIMIT"), async () => undefined);
+    assert.deepEqual(control, [250], "without a published wait the bounded exponential backoff is unchanged");
+});
+
+test("Test 27: the per-turn switch budget survives a turn longer than its TTL", async () => {
+    const { ctx, listeners, logs } = makeCtx();
+    let clock = 1000;
+    const models = ["B", "C", "D", "E"].map((p) => ({ provider: p, model: p.toLowerCase() + "-1" }));
+    apply(ctx, { maxSwitchesPerTurn: 3, models }, { now: () => clock, sleep: NO_SLEEP });
+    const agent = makeAgent();
+    assert.deepEqual(await runError(listeners, errorPayload(agent, "A", "QUOTA")), { kind: "retry" }, "first switch of the turn");
+    assert.deepEqual(await runError(listeners, errorPayload(agent, "B", "QUOTA")), { kind: "retry" }, "second switch of the turn");
+    clock += 2 * 3600 * 1000;
+    assert.deepEqual(await runError(listeners, errorPayload(agent, "C", "QUOTA")), { kind: "retry" }, "third switch of the same, now hours-old, turn");
+    const decision = await runError(listeners, errorPayload(agent, "D", "QUOTA"));
+    assert.equal(decision, undefined, "the fourth switch of a long turn is refused: the budget never expires mid-turn");
+    assert.ok(logs.some(([lvl, m]) => lvl === "error" && m.includes("switch budget exhausted")), "the stand-down says why");
+    assert.equal(switchLogCount(logs), 3, "exactly the configured number of switches");
+});
+
+test("Test 28: indefinite parks are named in the terminal dump instead of claiming health", async () => {
+    const { ctx, listeners, logs } = makeCtx();
+    apply(ctx, { autoRecover: false, models: [{ provider: "B", model: "b-1" }] }, { sleep: NO_SLEEP });
+    const agent = makeAgent();
+    await runError(listeners, errorPayload(agent, "A", "QUOTA"));
+    assert.equal(await runError(listeners, errorPayload(agent, "B", "QUOTA")), undefined, "no target left: stand down");
+    const dump = logs.find(([lvl, m]) => lvl === "error" && m.includes("provider states:"));
+    assert.ok(dump !== undefined, "the terminal log dumps provider states");
+    assert.ok(dump[1].includes("A=parked(indefinitely"), "A is reported as parked indefinitely");
+    assert.ok(dump[1].includes("B=parked(indefinitely"), "B is reported as parked indefinitely");
+    assert.ok(!dump[1].includes("every configured provider is healthy"), "it never claims all providers are healthy");
+});
+//#endregion

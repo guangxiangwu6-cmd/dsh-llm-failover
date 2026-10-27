@@ -22,11 +22,11 @@
 
 ## provider 名称配置错误
 
-**症状**：日志显示切换目标被跳过。
+**症状**：切换发生后，请求以 provider 解析或鉴权错误结束；日志里能看到切换目标就是那个名字。
 
-**原因**：`models` 池里写了不存在的 provider 名时，选目标会跳过它（不影响原请求）。
+**原因**：插件**不校验** provider 是否存在。`selectTarget` 只按"是否失败、是否在停车期"过滤池子，`models` 里写错的名字会被当作正常目标选中，真正的失败发生在 harness 解析该 provider 的时候。
 
-**解决**：确认 provider 名称与 llm-pi-ai settings 里的 profile 名完全一致。
+**解决**：逐字核对 provider 名称与 llm-pi-ai settings 里的 profile 名（大小写、连字符、后缀都算）。修正后重启 harness。
 
 ## 模型切换没有发生
 
@@ -48,11 +48,12 @@ AUTH / INVALID_CREDENTIAL 表示 API Key 无效。这是凭证问题，切换到
 
 ## 为什么某些错误只 retry
 
-EMPTY_RESPONSE 和 QUOTA 默认只 retry 不切换：
-- EMPTY_RESPONSE：退化空补全，可以安全重复，不一定需要切模型
-- QUOTA：配额问题，切模型不一定解决（同一 Provider 的不同模型通常共享配额）
+默认行为分两类：
 
-可通过 `failoverOnEmptyResponse: true` 和 `failoverOnQuota: true` 开启切换。
+- **EMPTY_RESPONSE 默认只 retry 不切换**：退化空补全可以安全重复，不一定需要换模型。用 `failoverOnEmptyResponse: true` 才切。
+- **QUOTA 默认按「墙」处理（`failoverOnQuota: true`，0.2.0 起）**：配额/余额/用量窗口是事实不是抖动，**第一次失败就切**并停到上游公布的重置时间（没公布就 `quotaCooldownSeconds`）。0.1.x 的"配额错也只 retry"是旧默认，已经不再适用；想退回旧行为才把 `failoverOnQuota` 关掉。
+
+同一 provider 的不同模型、同一把 key 的多个账号共享配额，所以"切到同 provider 的另一个模型"对 QUOTA 没有意义——真正有用的是切到别的 provider profile。
 
 ## 为什么 session 中看不到 failover 消息
 
@@ -81,7 +82,7 @@ EMPTY_RESPONSE 和 QUOTA 默认只 retry 不切换：
 - [ ] **重启成功** — DeepSeek Harness Desktop 能正常进入主界面，无报错弹窗
 - [ ] **插件激活** — 宿主日志面板出现 `llm-failover active` 行
 - [ ] **正常对话一轮** — 发起一次普通对话并收到完整回复
-- [ ] **模拟故障观察切换日志** — 临时把 models 池首位改成无效模型名触发失败，日志出现切换记录且会话仍能拿到回复；验证完还原配置
+- [ ] **模拟故障观察切换日志** — 让池首 provider 可控地失败（把该 profile 的 base URL 指向没人监听的本地端口 → TRANSPORT；或用一个返回 429/503 的本地 mock），日志出现切换记录且会话仍能拿到回复；验证完还原配置。不要用"无效模型名"：`UNKNOWN_MODEL` 是永久错误，永不切换
 - [ ] **恢复后确认回池说明** — 故障源恢复后（冷却到期或一次成功出活），日志出现该 provider 恢复/回池记录
 
 ## 墙（wall）与探针（probe）：0.2.0 的新日志怎么读
@@ -113,4 +114,6 @@ provider states: commandcode=parked(4h, wall), bailian=parked(42m, failures)
 
 - 四个 provider 全停时出现这三行。注意：**这些信息进不了客户端看到的错误**（`RequestErrorAction` 只有
   `{ kind: 'retry' } | undefined`，这个 seam 改不了文案），所以排查请以宿主日志为准。
-- `autoRecover: false` 时不会自动入场探针，只有重启或一次成功出活能恢复。
+- `autoRecover: false` 时不会自动入场探针，状态行会写成 `parked(indefinitely, wall; autoRecover is off)`。
+  这种停车只有重启能清；而且**一旦有请求被改道离开过它**，期间归属它的"成功"消息也会被判为歧义拒收
+  （无法排除那是替代模型的产物），日志里是 `ignoring a success attributed to …`。

@@ -6,10 +6,10 @@ DeepSeek Harness 的社区模型自动故障切换插件。当 Provider 出现 4
 
 ⚠️ Community plugin for DeepSeek Harness. Not affiliated with or endorsed by DeepSeek.
 
-[![version](https://img.shields.io/badge/version-0.2.0--rc.1-green)](https://github.com/guangxiangwu6-cmd/dsh-llm-failover/releases)
+[![version](https://img.shields.io/badge/version-0.2.0--rc.2-green)](https://github.com/guangxiangwu6-cmd/dsh-llm-failover/releases)
 [![license MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen)](https://nodejs.org)
-[![tests](https://img.shields.io/badge/tests-68%2F68%20passing-brightgreen)](test/failover.test.mjs)
+[![tests](https://img.shields.io/badge/tests-80%2F80%20passing-brightgreen)](test/failover.test.mjs)
 [![boot-safe](https://img.shields.io/badge/boot--safe-rehearsal%20proven-informational)](INSTALL.md)
 
 ## What & Why
@@ -54,11 +54,11 @@ Cooldown expires → A 以「探针」身份入场，一次请求定生死
 - **half-open 探针** — 冷却到期不直接放行，而是放一次探针请求：成功才恢复，失败立刻回停车且冷却翻倍（封顶）；上游公布的时间永远原样使用（信息不打折，只惩罚递增）
 - **Provider 健康管理** — 按 provider 粒度跟踪连续失败次数、停车原因与累计停车次数
 - **优先级池切换** — `models` 数组顺序即优先级；半开状态的 provider 不抢占健康 provider
-- **双通道恢复** — 冷却到期惰性入场探针 + assistant message 主动证明恢复（改道后的歧义证据会被拒收，避免冷却被自己发起的切换绕过）
+- **双通道恢复** — 冷却到期惰性入场探针 + assistant message 主动证明恢复（停车期内只要改道过，此后归属该 provider 的"成功"一律拒收：歧义覆盖**整段停车期**，不只是切过去那一分钟，避免冷却被自己发起的切换绕过）
 - **最大切换保护** — 单回合切换上限防止死循环
 - **错误分类** — 7 种可恢复错误 + 多种永久错误，精确决定是否切换；每类一个开关
 - **终止时说得清** — 所有 provider 都停车时，日志给出最早恢复的是谁、还有多久，并附全 provider 状态快照
-- **两套本地测试** — `node --test test/failover.test.mjs`（22 项，node:test 风格）+ `node test/smoke.test.mjs`（46 项，纯离线、不需要 harness）
+- **两套本地测试** — `node --test test/failover.test.mjs`（34 项，node:test 风格）+ `node test/smoke.test.mjs`（46 项，纯离线、不需要 harness）
 - **敏感信息日志脱敏** — URL 凭据 / Bearer token / key 参数自动掩码
 - **Session 安全设计** — 不写自定义事件类型，避免会话重载兼容问题
 - **与 llm-retry 共存** — 阈值以下决策权归 llm-retry，达到阈值才由本插件接管；下游任何决定都原样尊重
@@ -87,7 +87,7 @@ Copy-Item "<本仓库目录>\\*" $dst -Recurse -Force -Exclude node_modules
 
 ## Quick Configuration
 
-`models` 数组的顺序就是故障切换优先级——排在第一位的是主模型，后面的依次作为备份。
+健康的时候插件不碰路由：请求仍然打在宿主自己选定的 provider 上。`models` 只决定**故障时**的备份选择顺序——当前 provider 不可用了，就取池里第一个健康的条目顶上。
 
 ```yaml
 - insert:
@@ -103,12 +103,29 @@ Copy-Item "<本仓库目录>\\*" $dst -Recurse -Force -Exclude node_modules
         maxConsecutiveFailures: 5      # 「抖动」类失败：同一 provider 连续失败多少次后切换
         cooldownSeconds: 60            # 抖动类的停车时长（必须 > 0）
         quotaCooldownSeconds: 14400    # 「墙」类（配额/用量窗口，且上游没给重置时间）的停车时长
-        maxCooldownSeconds: 86400      # 连续停车翻倍的上限
+        maxCooldownSeconds: 86400      # 本地惩罚性退避的翻倍上限（上游公布的重置不受它截断）
         autoRecover: true              # 冷却到期是否自动入场探针
         maxSwitchesPerTurn: 8          # 单回合最大切换次数
 ```
 
 未配置键取默认值；未知键不会导致报错，只记录警告后忽略。`models` 为空时插件保持惰性。
+
+### 多账号：一个账号一个 provider profile
+
+健康状态按 **provider 粒度**管理：同一 provider 下的多个模型、同一把 key 的多个账号，共享一套失败计数和停车状态。
+
+- 因此**同 provider 多账号不是独立故障域**——账号 A 的配额用尽时，同一个 profile 下的账号 B 一起停。
+- 想让两个账号轮流上，就把每个账号各配成一个独立的 llm-pi-ai profile，再把它们当成两个 provider 放进池里：
+
+```yaml
+        models:
+          - provider: deepseek-official        # 账号 A（profile 1）
+            model: deepseek-v4-flash
+          - provider: deepseek-official-b      # 账号 B（profile 2，另一把 key）
+            model: deepseek-v4-flash
+```
+
+当前版本**没有**宿主贯通的 `accountKey/routeKey`，所以做不到"同一个 profile 内多账号轮换"；上面这种 profile-per-account 是唯一能吃到 provider 级隔离的写法。
 
 ### Per-class failover switches
 
@@ -170,13 +187,14 @@ provider 都在停车；那时日志会给出最早恢复的那个是谁、还�
 
 ## Project Status
 
-> **Release Candidate** — 版本 0.2.0-rc.1
+> **Release Candidate** — 版本 0.2.0-rc.2
 
-- ✅ 核心 failover 功能已实现并通过两套本地回归测试（`node --test test/failover.test.mjs` 22 项 + `node test/smoke.test.mjs` 46 项，合计 68 项，都不需要 harness 在场）
+- ✅ 核心 failover 功能已实现并通过两套本地回归测试（`node --test test/failover.test.mjs` 34 项 + `node test/smoke.test.mjs` 46 项，合计 80 项，都不需要 harness 在场）
 - ✅ 启动安全设计经真实加载器验证（见 [INSTALL.md](INSTALL.md) 的安装前冒烟彩排）
 - ✅ 已安装进真实 DSH Desktop 环境（2026-08-27）
 - ✅ 冷却保护（2026-09-21）：切换后返回的"成功"证据若与插件自己发起的改道冲突，会被判为歧义并拒收，避免冷却被提前取消
 - ✅ **墙/抖动分开 + half-open 探针（2026-09-25）**：配额与用量窗口第一次就切并按上游公布的重置时间停车；冷却到期改为放一次探针，探针失败立刻回停车且冷却翻倍封顶；终止日志给出最早恢复时间与全 provider 状态。判定表与取舍见 [docs/architecture.md](docs/architecture.md)，借鉴来源见下
+- ✅ **rc.2 状态机修复（2026-10-27）**：已停车 provider 的迟到失败不再重复停车、不再延长冷却；歧义成功的拒收覆盖整段停车期（4h 墙与无限停车都绕不过去）；同代 half-open 探针的迟到失败按探针失败处理，而不是从 1/5 重新计数；一次失败里的多个重置信号取**最晚**；上游公布的重置不再被 `maxCooldownSeconds` 截断；自回退等待尊重 Retry-After；长回合的切换预算不再被 TTL 清扫掉；`autoRecover: false` 的无限停车在终止日志里如实写 `parked(indefinitely …)`
 - ✅ QA 彩排脚本 6 个（smoke / badconfig / disabled / doc-crosscheck / s0-session-compat / final-round）
 - 🔄 当前生产配置：4 个目标，每厂商一条 —— deepseek-official/deepseek-flash、bailian/qwen3.8-flash、ark-plan/glm-5.3-flash、commandcode/deepseek/deepseek-v4.1-flash
 
@@ -221,7 +239,7 @@ provider 都在停车；那时日志会给出最早恢复的那个是谁、还�
 |---------|-------|
 | 插件没有加载 | 启动日志搜索 `llm-failover`，确认目录复制位置正确 |
 | models 没有配置 | `models` 为空时插件仅日志提示，不执行切换 |
-| provider 名称配置错误 | 切换目标会跳过不存在的 provider，不影响原请求 |
+| provider 名称配置错误 | 插件**不校验** provider 是否存在：写错的名字会被当作切换目标用，请求随后以该 provider 的解析/鉴权错误结束。逐字对照 llm-pi-ai settings 里的 profile 名 |
 | 模型切换没有发生 | 检查 `maxConsecutiveFailures` 是否达到；检查 per-class 开关 |
 | 为什么 AUTH 不切换 | 凭证问题切换无用，设计行为 |
 | 为什么某些错误只 retry | 参考 Error Classification 表 |

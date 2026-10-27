@@ -33,12 +33,19 @@
       │
       └── 抖动（5xx/超时/传输/流中断/短促 429）
           │
+          ├── 该 provider 早就在停车期里（迟到结果：请求在停车之前就发出去了）
+          │   └── 不计数、不重新停车、不延长冷却：直接改道到健康目标（没有目标则收手）
+          │
+          ├── 同一代 half-open 探针的迟到失败（这一代已有兄弟探针成功、账本已清空）
+          │   └── 立刻按探针失败处理：恢复原停车历史 → 冷却翻倍 → 改道
+          │
           ├── 该 provider 连续失败计数 +1（半开状态下不计数，直接按探针失败处理）
           │
           ├── 未达 maxConsecutiveFailures 阈值
           │   └── 返回 undefined → 交给下游栈处理（通常是 dsh-llm-retry 的有界指数退避重试）
           │       下游返回的任何决策（不限于 retry）都原样透传，不会被覆盖
           │       若没有任何下游策略认领失败，插件以 250ms 起步、上限 2s 的指数退避自行重试同一 provider
+          │       （上游公布了 Retry-After 时，等待取两者较大值——不往 30 秒的窗口里塞 250ms 的热循环）
           │
           └── 达到阈值（或该 provider 正在半开探针中且这次又失败）
               ├── 停车：cooldownSeconds × 2^(连续停车次数-1)，封顶 maxCooldownSeconds
@@ -51,9 +58,12 @@
 | 信号 | 判定 | 停车 |
 | --- | --- | --- |
 | `failure.code === "QUOTA"` | 墙 | `quotaCooldownSeconds`，按连续停车翻倍 |
-| 任何 ≥60s 的重置（`providerRetryAfterMs`、正文 `resets at <ISO>`、"retry again in N 单位"） | 墙 | **上游给的值原样**（≤30 天上界） |
+| 任何 ≥60s 的重置（`providerRetryAfterMs`、正文 `resets at <ISO>`、"retry again in N 单位"） | 墙 | **上游给的值原样**（≤30 天上界，不受 `maxCooldownSeconds` 截断） |
 | 账号级措辞（"usage limit for your plan"、"insufficient credits"、"premium credits exhausted"…） | 墙 | `quotaCooldownSeconds`，翻倍 |
-| 其余（含 <60s 的重置） | 抖动 | `cooldownSeconds`，翻倍 |
+| 其余（含 <60s 的重置） | 抖动 | `cooldownSeconds`，翻倍；<60s 的重置只作自回退等待的下限 |
+
+一次失败可能同时带多个信号（短的 `Retry-After` 头 + 正文里长的 `resets at` + "retry again in 30 seconds"）。
+**取最晚的那个可信值**：取第一个看到的会提前放行，然后一头撞回同一堵墙。同值取更结构化的来源。
 
 两个刻意的取舍：
 - **模糊措辞不算墙**。单独一句 "quota exceeded" 既可能是每分钟配额也可能是月度额度，只有上游同时公布了
@@ -113,9 +123,13 @@ provider states: commandcode=parked(4h, wall), bailian=parked(42m, failures)
 
 ### 通道二：assistant message 主动恢复
 
-任何 assistant 消息证明某 provider 成功出活时，立即主动恢复并清零连续失败计数。**歧义保护**：若窗口内
-刚发生过"由本插件发起的改道"，这条归属证据会被判为歧义并拒收（`ignoring a success attributed to …`），
-否则下一次请求会被弹回一个仍然失败的 provider。
+任何 assistant 消息证明某 provider 成功出活时，立即主动恢复并清零连续失败计数。**歧义保护**：停车期内
+只要发生过"由本插件发起的改道"，此后归属该 provider 的"成功"就一律判为歧义并拒收
+（`ignoring a success attributed to …`），否则下一次请求会被弹回一个仍然失败的 provider。
+
+歧义的范围是**整段停车期**，不是一个冷却窗口的长度：配额墙可以停四小时，60 秒的时间窗在它面前等于不存在。
+所以这个标记挂在账户条目上（`reroutedWhileParked`），随账本一起消失，成功的探针不受影响（那时停车期已结束）。
+`autoRecover: false` 的无限停车同理：改道过一次之后，只有重启能把它放回来——那种状态下的"成功"永远无法排除是替代模型的产物。
 
 ## 上下文/任务连续性
 
@@ -130,17 +144,20 @@ provider states: commandcode=parked(4h, wall), bailian=parked(42m, failures)
 ## 健康管理粒度
 
 - 以 provider 为健康管理粒度（与 llm-retry 一致）
-- 同一 provider 下多个模型共享健康状态
+- 同一 provider 下多个模型共享健康状态（同一个 profile 里的多个账号也共享：想要账号级隔离，就把每个账号配成一个独立 profile）
 - 多个并发 agent 的每回合切换预算相互独立（按 agent.id 计数）
 - 只有实际发生的切换才计入预算
-- 长期未进入 idle 状态的 agent，其预算条目会在 1 小时后惰性清除
+- 长期未进入 idle 状态的 agent，其预算条目会在 1 小时后惰性清除；**当前这一回合的记录永不被清扫**，否则跨小时的回合会白拿一份新预算
+- half-open 探针的代际记录（provider → 放行时的停车次数与原因）用于判定"同代迟到失败"：下一次针对该 provider 的请求构建、重新停车或账本清空后即作废，按 provider 计数，天然有界
 - provider 健康条目在完全恢复后即删除——两张状态表均有界
 
 ## 已知限制
 
 - 切换目标必须显式列在 `models` 里；不会从适配器目录自动推导
+- `models` 里的 provider 名不做存在性校验：写错的名字会被当成正常目标选中，失败发生在 harness 解析它的时候
 - 直接消费 `ctx.llm.stream()` 的旁路调用（如标题生成、compaction 摘要）不在 agent loop 重试边界内
-- 半开探针没有并发上限（见「双通道恢复」一节的说明）
+- 半开探针没有并发上限（见「双通道恢复」一节的说明）；同代多个探针的结果都会被正确判定，但放行数量本身不受控
+- 探针代际靠"下一次请求构建"结算：若宿主在探针之后既没有构建新请求、又送来一个针对该 provider 的失败，这次失败按探针失败处理（保守方向——多停一次，而不是在刚失败过的 provider 上继续跑）
 - 健康状态只在内存里：重启后从头开始（乐观），第一次失败重新学习
 
 ## 借鉴来源

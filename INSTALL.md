@@ -14,7 +14,7 @@ lm-pi-ai settings 中已配置至少两个 provider profile（否则 failover �
 |------|------|
 | package.json | 插件包描述（名称/入口/依赖声明） |
 | lib/index.js | 插件全部运行时逻辑（单文件，无构建步骤） |
-| test/failover.test.mjs | 19 个场景测试（node --test） |
+| test/failover.test.mjs | 状态机场景回归（node:test；数量见文末「本地回归测试」，不在文件表里钉死） |
 | README.md | 产品定位 / 安装 / 配置 / 错误分类 / 架构概述 |
 | docs/ | 技术文档（架构详解 / 会话兼容性 / 故障排查） |
 | patches/cordis.patch.snippet.yml | 安装时要追加的配置片段模板 |
@@ -85,7 +85,7 @@ node '<彩排目录>\node_modules\@deepseek-ai\dsh\lib\bin.js' --profile headles
 - 与 llm-retry 共存：阈值以下决策权仍归 llm-retry（行为不变）；达到阈值才由本插件接管并切换。
 - 主要残余风险：
   1) 若上游大版本变更 waterfall 载荷字段名（provider/failure/code 等），插件需要同步更新；
-  2) models 池里写了不存在的 provider 名时，选目标会跳过它（不影响原请求）；
+  2) models 池**不校验** provider 是否存在：写错的名字不会被"跳过"，它会被当作切换目标使用，请求随后以该 provider 的解析/鉴权错误结束——插件只按失败与停车状态选目标；
   3) 极端情况下所有模型连续失败，任务将以清晰的最终错误终止（设计行为，替代无限卡死）。
 - 插件自身抛错时由 cordis 以插件为单位隔离，不会拖垮 Host；最坏情况按上文「卸载」两步回退。
 
@@ -96,7 +96,7 @@ node '<彩排目录>\node_modules\@deepseek-ai\dsh\lib\bin.js' --profile headles
 - [ ] **重启成功** —— 验证：重启 DeepSeek Harness Desktop 能正常进入主界面，无报错弹窗。
 - [ ] **插件激活** —— 验证：桌面 profile 的宿主日志面板出现 `llm-failover active` 行（日志里过滤 llm-failover）。
 - [ ] **正常对话一轮** —— 验证：发起一次普通对话并收到完整回复，体验与未装插件时无明显差异。
-- [ ] **模拟故障观察切换日志** —— 验证：临时把 models 池首位改成无效模型名触发失败，日志出现切换记录且会话仍能拿到回复；验证完还原配置。
+- [ ] **模拟故障观察切换日志** —— 验证：让池首 provider 可控地失败（例如把它那个 profile 的 base URL 指向一个没人监听的本地端口 → TRANSPORT 类失败，或用一个返回 429/503 的本地 mock），日志出现切换记录且会话仍能拿到回复；验证完还原配置。**不要**用"改成无效模型名"来触发：`UNKNOWN_MODEL` 属于永久错误，永不切换。
 - [ ] **恢复后确认回池说明** —— 验证：故障源恢复后（冷却到期或一次成功出活），日志出现该 provider 恢复/回池记录，路由回到优先级池首位。
 - [ ] **墙类失败第一次就切** —— 验证：让池首 provider 返回配额类错误（或临时把它的配额用尽），日志出现 `parked for … (quota-code)` 且**第一次失败**就切换；等停车到期后出现 `cooldown elapsed; admitting it back as a probe`。
 
@@ -126,9 +126,11 @@ node tools/sync-to-dsh.mjs --dest ... --stamp mylabel  # 自定义备份后缀
 ## 本地回归测试（两套，都不需要 harness 在场）
 
 ```sh
-node --test test/failover.test.mjs   # 22 项，node:test 风格；直接导入 lib/index.js
-node test/smoke.test.mjs             # 46 项，纯离线；自带 schemastery 桩与 ctx 替身
+node --test test/failover.test.mjs   # node:test 风格；直接导入 lib/index.js
+node test/smoke.test.mjs             # 纯离线；自带 schemastery 桩与 ctx 替身
 ```
+
+两套都必须跑；数量会随回归增长，以命令输出的 `# pass` / `RESULT:` 为准，不在这里钉死。
 
 `test/failover.test.mjs` 需要 `@deepseek-ai/schemastery` 可解析（harness 环境里天然满足）。在本仓库单独跑它，可先建一个桩（`node_modules/` 已被 gitignore）：
 
@@ -147,7 +149,7 @@ export default z;
 | 字段 | 默认 | 说明 |
 | --- | --- | --- |
 | `quotaCooldownSeconds` | `14400`（4h） | 「墙」类失败（配额/用量窗口，且上游没公布重置时间）的停车时长 |
-| `maxCooldownSeconds` | `86400`（24h） | 连续停车翻倍的上限，也是相信上游重置时间的上界之一 |
+| `maxCooldownSeconds` | `86400`（24h） | **本地惩罚性退避**的翻倍上限（`cooldownSeconds` / `quotaCooldownSeconds` 都受它约束）。上游自己公布的重置时间不受它截断，只受内部 30 天可信上界约束 |
 | `failoverOnQuota` | `true`（0.1.1 是 `false`） | 墙类失败第一次就切；关掉它退回"配额错也交给下游重试"的旧行为 |
 
 判定表（什么算墙、停多久、何时放探针）见 [docs/architecture.md](docs/architecture.md)。
